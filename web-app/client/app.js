@@ -1,10 +1,9 @@
 /* eslint-disable */
 // @ts-nocheck
-// OpenClaw Web App - Frontend (browser-only, not subject to project TS lint)
+// OpenClaw Web App - Frontend
 
 const app = document.getElementById("app");
 
-// ---- State ----
 const state = {
   page: "loading",
   token: localStorage.getItem("openclaw_token"),
@@ -21,19 +20,21 @@ const state = {
   streamRunId: null,
   sidebarTab: "workspace",
   workspacePath: "",
-  workspaceFiles: [],
   workspaceTree: [],
   treePath: "",
   viewingFile: null,
   viewingFileContent: "",
+  editingFile: false,
+  editContent: "",
 };
 
-// ---- API Helpers ----
+// ---- API ----
 async function api(method, path, body) {
   const headers = { "Content-Type": "application/json" };
   if (state.token) headers["Authorization"] = "Bearer " + state.token;
   const opts = { method, headers };
-  if (body && method !== "GET") opts.body = JSON.stringify(body);
+  if (body && method !== "GET" && method !== "DELETE") opts.body = JSON.stringify(body);
+  if (method === "DELETE" && body) opts.body = JSON.stringify(body);
   const res = await fetch(path, opts);
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || "请求失败");
@@ -121,7 +122,6 @@ async function doDeleteAccount() {
 // ---- WebSocket ----
 let wsRetryCount = 0;
 let wsRetryTimer = null;
-const MAX_WS_RETRIES = 10;
 
 function connectWs() {
   if (state.ws) {
@@ -132,23 +132,16 @@ function connectWs() {
     clearTimeout(wsRetryTimer);
     wsRetryTimer = null;
   }
-
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const url = proto + "//" + location.host + "/ws/chat?token=" + state.token;
   let ws;
   try {
     ws = new WebSocket(url);
   } catch {
-    state.gatewayStatus = "unavailable";
-    render();
     scheduleWsRetry();
     return;
   }
   state.ws = ws;
-
-  ws.addEventListener("open", function () {
-    // Connection to our web-app server established; waiting for gateway proxy status
-  });
 
   ws.addEventListener("message", function (event) {
     let msg;
@@ -157,7 +150,6 @@ function connectWs() {
     } catch {
       return;
     }
-
     if (msg.type === "connected") {
       state.connected = true;
       state.gatewayStatus = "connected";
@@ -169,25 +161,21 @@ function connectWs() {
       render();
       return;
     }
-
     if (msg.type === "gateway_status") {
       state.gatewayStatus = msg.status;
       state.connected = msg.status === "connected";
-      if (msg.status === "unavailable" || msg.status === "disconnected") {
-        // Don't spam messages — just update status bar
-        if (!state.gatewayStatusShown) {
-          state.gatewayStatusShown = true;
-          const hint = msg.message || "Gateway 未连接，请确保 openclaw gateway 已运行";
-          addSystemMessage(hint);
-        }
-      }
-      if (msg.status === "auth_failed") {
-        addSystemMessage("Gateway 认证失败，请检查 token 配置");
+      if (
+        !state.gatewayStatusShown &&
+        (msg.status === "unavailable" ||
+          msg.status === "disconnected" ||
+          msg.status === "auth_failed")
+      ) {
+        state.gatewayStatusShown = true;
+        addSystemMessage(msg.message || "Gateway 未连接");
       }
       render();
       return;
     }
-
     if (msg.type === "error") {
       addSystemMessage("错误: " + msg.message);
       render();
@@ -209,18 +197,11 @@ function connectWs() {
     render();
     scheduleWsRetry();
   });
-
-  ws.addEventListener("error", function () {
-    // "close" fires after "error"
-  });
 }
 
 function scheduleWsRetry() {
-  if (!state.token || state.page !== "main") return;
-  if (wsRetryCount >= MAX_WS_RETRIES) return;
-  const delay = Math.min(3000 * Math.pow(1.5, wsRetryCount), 30000);
-  wsRetryCount++;
-  wsRetryTimer = setTimeout(connectWs, delay);
+  if (!state.token || state.page !== "main" || wsRetryCount >= 10) return;
+  wsRetryTimer = setTimeout(connectWs, Math.min(3000 * Math.pow(1.5, wsRetryCount++), 30000));
 }
 
 let reqCounter = 0;
@@ -243,44 +224,35 @@ function wsRequest(method, params) {
 }
 
 function handleResponse(msg) {
-  const entry = pendingReqs.get(msg.id);
-  if (!entry) return;
+  const e = pendingReqs.get(msg.id);
+  if (!e) return;
   pendingReqs.delete(msg.id);
-  clearTimeout(entry.timer);
-  if (msg.ok) entry.resolve(msg.payload);
-  else entry.reject(new Error(msg.error && msg.error.message ? msg.error.message : "请求失败"));
+  clearTimeout(e.timer);
+  if (msg.ok) e.resolve(msg.payload);
+  else e.reject(new Error(msg.error && msg.error.message ? msg.error.message : "请求失败"));
 }
 
 function handleEvent(msg) {
-  const evtName = msg.event;
-  const payload = msg.payload || {};
-
-  if (evtName === "chat.event" || evtName === "chat") {
-    const chatState = payload.state;
-    const runId = payload.runId;
-
-    if (chatState === "delta") {
-      if (state.streamRunId !== runId) {
-        state.streamRunId = runId;
+  const p = msg.payload || {};
+  if (msg.event === "chat.event" || msg.event === "chat") {
+    if (p.state === "delta") {
+      if (state.streamRunId !== p.runId) {
+        state.streamRunId = p.runId;
         state.streaming = "";
       }
-      const text = extractTextFromMessage(payload.message);
-      if (text) state.streaming += text;
+      const t = extractText(p.message);
+      if (t) state.streaming += t;
       render();
-    } else if (chatState === "final") {
-      if (state.streaming) {
-        state.messages.push({ role: "assistant", content: state.streaming, ts: Date.now() });
-      } else {
-        const text = extractTextFromMessage(payload.message);
-        if (text) state.messages.push({ role: "assistant", content: text, ts: Date.now() });
-      }
+    } else if (p.state === "final") {
+      const text = state.streaming || extractText(p.message);
+      if (text) state.messages.push({ role: "assistant", content: text, ts: Date.now() });
       state.streaming = "";
       state.streamRunId = null;
       state.sending = false;
       render();
       scrollToBottom();
-    } else if (chatState === "error" || chatState === "aborted") {
-      if (payload.errorMessage) addSystemMessage("错误: " + payload.errorMessage);
+    } else if (p.state === "error" || p.state === "aborted") {
+      if (p.errorMessage) addSystemMessage("错误: " + p.errorMessage);
       state.streaming = "";
       state.streamRunId = null;
       state.sending = false;
@@ -289,26 +261,22 @@ function handleEvent(msg) {
   }
 }
 
-function extractTextFromMessage(message) {
-  if (!message) return "";
-  if (typeof message === "string") return message;
-  if (typeof message === "object") {
-    if (message.content) {
-      if (typeof message.content === "string") return message.content;
-      if (Array.isArray(message.content)) {
-        return message.content
-          .filter(function (b) {
-            return b.type === "text";
-          })
-          .map(function (b) {
-            return b.text || "";
-          })
-          .join("");
-      }
-    }
-    if (message.text) return message.text;
+function extractText(m) {
+  if (!m) return "";
+  if (typeof m === "string") return m;
+  if (m.content) {
+    if (typeof m.content === "string") return m.content;
+    if (Array.isArray(m.content))
+      return m.content
+        .filter(function (b) {
+          return b.type === "text";
+        })
+        .map(function (b) {
+          return b.text || "";
+        })
+        .join("");
   }
-  return "";
+  return m.text || "";
 }
 
 // ---- Chat ----
@@ -318,7 +286,7 @@ async function loadHistory() {
     if (res && Array.isArray(res.messages)) {
       state.messages = res.messages
         .map(function (m) {
-          return { role: m.role || "unknown", content: extractTextFromMessage(m), ts: m.ts || 0 };
+          return { role: m.role || "unknown", content: extractText(m), ts: m.ts || 0 };
         })
         .filter(function (m) {
           return m.content;
@@ -339,8 +307,11 @@ async function sendMessage(text) {
   render();
   scrollToBottom();
   try {
-    const idempotencyKey = "web-" + Date.now() + "-" + Math.random().toString(36).slice(2);
-    await wsRequest("chat.send", { message: text.trim(), idempotencyKey, timeoutMs: 120000 });
+    await wsRequest("chat.send", {
+      message: text.trim(),
+      idempotencyKey: "web-" + Date.now() + "-" + Math.random().toString(36).slice(2),
+      timeoutMs: 120000,
+    });
   } catch (err) {
     addSystemMessage("发送失败: " + err.message);
     state.sending = false;
@@ -351,10 +322,9 @@ async function sendMessage(text) {
 function addSystemMessage(text) {
   state.messages.push({ role: "system", content: text, ts: Date.now() });
 }
-
 function scrollToBottom() {
   requestAnimationFrame(function () {
-    const el = document.getElementById("chat-messages");
+    var el = document.getElementById("chat-messages");
     if (el) el.scrollTop = el.scrollHeight;
   });
 }
@@ -362,19 +332,9 @@ function scrollToBottom() {
 // ---- Workspace ----
 async function loadWorkspace() {
   try {
-    const pathRes = await api("GET", "/api/workspace/path");
-    state.workspacePath = pathRes.workspace;
-  } catch {
-    /* ignore */
-  }
-  try {
-    const filesRes = await api("GET", "/api/workspace/files");
-    state.workspaceFiles = filesRes.files || [];
-  } catch {
-    /* ignore */
-  }
+    state.workspacePath = (await api("GET", "/api/workspace/path")).workspace;
+  } catch {}
   await loadTree("");
-  render();
 }
 
 async function loadTree(subPath) {
@@ -393,58 +353,196 @@ async function openFile(filePath) {
     const res = await api("GET", "/api/workspace/read?path=" + encodeURIComponent(filePath));
     state.viewingFile = filePath;
     state.viewingFileContent = res.content || "";
+    state.editingFile = false;
+    state.editContent = "";
     render();
   } catch (err) {
-    addSystemMessage("无法读取文件: " + err.message);
-    render();
+    alert("无法读取文件: " + err.message);
   }
 }
 
 function closeFile() {
   state.viewingFile = null;
   state.viewingFileContent = "";
+  state.editingFile = false;
   render();
 }
 
-// ---- Rendering ----
+function startEdit() {
+  state.editingFile = true;
+  state.editContent = state.viewingFileContent;
+  render();
+  var ta = document.getElementById("file-editor");
+  if (ta) ta.focus();
+}
+
+async function saveFile() {
+  if (!state.viewingFile) return;
+  try {
+    await api("POST", "/api/workspace/write", {
+      path: state.viewingFile,
+      content: state.editContent,
+    });
+    state.viewingFileContent = state.editContent;
+    state.editingFile = false;
+    render();
+    void loadTree(state.treePath);
+  } catch (err) {
+    alert("保存失败: " + err.message);
+  }
+}
+
+function cancelEdit() {
+  state.editingFile = false;
+  render();
+}
+
+async function createNewFile() {
+  var name = prompt("输入文件名（可含路径，如 docs/note.md）:");
+  if (!name) return;
+  var fullPath = state.treePath ? state.treePath + "/" + name : name;
+  try {
+    await api("POST", "/api/workspace/write", { path: fullPath, content: "" });
+    void loadTree(state.treePath);
+    void openFile(fullPath);
+  } catch (err) {
+    alert("创建失败: " + err.message);
+  }
+}
+
+async function createNewFolder() {
+  var name = prompt("输入文件夹名:");
+  if (!name) return;
+  var fullPath = state.treePath ? state.treePath + "/" + name : name;
+  try {
+    await api("POST", "/api/workspace/mkdir", { path: fullPath });
+    void loadTree(state.treePath);
+  } catch (err) {
+    alert("创建失败: " + err.message);
+  }
+}
+
+async function deleteItem(itemPath) {
+  var fullPath = state.treePath ? state.treePath + "/" + itemPath : itemPath;
+  if (!confirm("确定删除 " + fullPath + " ？")) return;
+  try {
+    await api("DELETE", "/api/workspace/delete?path=" + encodeURIComponent(fullPath));
+    if (state.viewingFile === fullPath) closeFile();
+    void loadTree(state.treePath);
+  } catch (err) {
+    alert("删除失败: " + err.message);
+  }
+}
+
+async function renameItem(itemPath) {
+  var fullPath = state.treePath ? state.treePath + "/" + itemPath : itemPath;
+  var newName = prompt("新名称:", itemPath);
+  if (!newName || newName === itemPath) return;
+  var newFullPath = state.treePath ? state.treePath + "/" + newName : newName;
+  try {
+    await api("POST", "/api/workspace/rename", { oldPath: fullPath, newPath: newFullPath });
+    if (state.viewingFile === fullPath) {
+      state.viewingFile = newFullPath;
+    }
+    void loadTree(state.treePath);
+  } catch (err) {
+    alert("重命名失败: " + err.message);
+  }
+}
+
+async function uploadFiles() {
+  var input = document.createElement("input");
+  input.type = "file";
+  input.multiple = true;
+  input.addEventListener("change", async function () {
+    if (!input.files || input.files.length === 0) return;
+    var formData = new FormData();
+    formData.append("targetDir", state.treePath || "");
+    for (var i = 0; i < input.files.length; i++) {
+      formData.append("files", input.files[i], input.files[i].name);
+    }
+    try {
+      var res = await fetch("/api/workspace/upload", {
+        method: "POST",
+        headers: { Authorization: "Bearer " + state.token },
+        body: formData,
+      });
+      var data = await res.json();
+      if (!res.ok) throw new Error(data.error || "上传失败");
+      void loadTree(state.treePath);
+    } catch (err) {
+      alert("上传失败: " + err.message);
+    }
+  });
+  input.click();
+}
+
+async function uploadFolder() {
+  var input = document.createElement("input");
+  input.type = "file";
+  input.multiple = true;
+  input.setAttribute("webkitdirectory", "");
+  input.addEventListener("change", async function () {
+    if (!input.files || input.files.length === 0) return;
+    var formData = new FormData();
+    formData.append("targetDir", state.treePath || "");
+    for (var i = 0; i < input.files.length; i++) {
+      var f = input.files[i];
+      var relPath = f.webkitRelativePath || f.name;
+      formData.append("files", f, relPath);
+    }
+    try {
+      var res = await fetch("/api/workspace/upload", {
+        method: "POST",
+        headers: { Authorization: "Bearer " + state.token },
+        body: formData,
+      });
+      var data = await res.json();
+      if (!res.ok) throw new Error(data.error || "上传失败");
+      void loadTree(state.treePath);
+    } catch (err) {
+      alert("上传失败: " + err.message);
+    }
+  });
+  input.click();
+}
+
+// ---- Render ----
 function render() {
   if (state.page === "loading") {
     app.innerHTML =
       '<div class="auth-container"><div class="auth-card"><h1>加载中...</h1></div></div>';
-  } else if (state.page === "login") {
+    return;
+  }
+  if (state.page === "login") {
     renderLogin();
-  } else if (state.page === "register") {
+    return;
+  }
+  if (state.page === "register") {
     renderRegister();
-  } else if (state.page === "main") {
+    return;
+  }
+  if (state.page === "main") {
     renderMain();
+    return;
   }
 }
 
 function renderLogin() {
   app.innerHTML =
-    '<div class="auth-container"><div class="auth-card">' +
-    '<h1>OpenClaw Web</h1><p class="subtitle">登录到你的 AI Agent</p>' +
-    '<div id="auth-error" class="auth-error" style="display:none"></div>' +
-    '<form id="login-form">' +
-    '<div class="form-group"><label>用户名</label><input type="text" id="login-username" required autocomplete="username" placeholder="请输入用户名"></div>' +
-    '<div class="form-group"><label>密码</label><input type="password" id="login-password" required autocomplete="current-password" placeholder="请输入密码"></div>' +
-    '<button type="submit" class="btn btn-primary">登录</button>' +
-    "</form>" +
-    '<p class="auth-link">还没有账号？<a id="goto-register">注册</a></p>' +
-    "</div></div>";
-
+    '<div class="auth-container"><div class="auth-card"><h1>OpenClaw Web</h1><p class="subtitle">登录到你的 AI Agent</p><div id="auth-error" class="auth-error" style="display:none"></div><form id="login-form"><div class="form-group"><label>用户名</label><input type="text" id="login-username" required autocomplete="username" placeholder="请输入用户名"></div><div class="form-group"><label>密码</label><input type="password" id="login-password" required autocomplete="current-password" placeholder="请输入密码"></div><button type="submit" class="btn btn-primary">登录</button></form><p class="auth-link">还没有账号？<a id="goto-register">注册</a></p></div></div>';
   document.getElementById("login-form").addEventListener("submit", async function (e) {
     e.preventDefault();
-    const errEl = document.getElementById("auth-error");
-    errEl.style.display = "none";
+    var err = document.getElementById("auth-error");
+    err.style.display = "none";
     try {
       await doLogin(
         document.getElementById("login-username").value,
         document.getElementById("login-password").value,
       );
-    } catch (err) {
-      errEl.textContent = err.message;
-      errEl.style.display = "block";
+    } catch (ex) {
+      err.textContent = ex.message;
+      err.style.display = "block";
     }
   });
   document.getElementById("goto-register").addEventListener("click", function () {
@@ -455,31 +553,20 @@ function renderLogin() {
 
 function renderRegister() {
   app.innerHTML =
-    '<div class="auth-container"><div class="auth-card">' +
-    '<h1>创建账号</h1><p class="subtitle">注册后将自动创建你的专属 AI Agent</p>' +
-    '<div id="auth-error" class="auth-error" style="display:none"></div>' +
-    '<form id="register-form">' +
-    '<div class="form-group"><label>用户名</label><input type="text" id="reg-username" required autocomplete="username" placeholder="2-32 个字符"></div>' +
-    '<div class="form-group"><label>显示名称</label><input type="text" id="reg-displayname" placeholder="可选，默认为用户名"></div>' +
-    '<div class="form-group"><label>密码</label><input type="password" id="reg-password" required autocomplete="new-password" placeholder="至少 4 个字符"></div>' +
-    '<button type="submit" class="btn btn-primary">注册</button>' +
-    "</form>" +
-    '<p class="auth-link">已有账号？<a id="goto-login">登录</a></p>' +
-    "</div></div>";
-
+    '<div class="auth-container"><div class="auth-card"><h1>创建账号</h1><p class="subtitle">注册后将自动创建你的专属 AI Agent</p><div id="auth-error" class="auth-error" style="display:none"></div><form id="register-form"><div class="form-group"><label>用户名</label><input type="text" id="reg-username" required autocomplete="username" placeholder="2-32 个字符"></div><div class="form-group"><label>显示名称</label><input type="text" id="reg-displayname" placeholder="可选"></div><div class="form-group"><label>密码</label><input type="password" id="reg-password" required autocomplete="new-password" placeholder="至少 4 个字符"></div><button type="submit" class="btn btn-primary">注册</button></form><p class="auth-link">已有账号？<a id="goto-login">登录</a></p></div></div>';
   document.getElementById("register-form").addEventListener("submit", async function (e) {
     e.preventDefault();
-    const errEl = document.getElementById("auth-error");
-    errEl.style.display = "none";
+    var err = document.getElementById("auth-error");
+    err.style.display = "none";
     try {
       await doRegister(
         document.getElementById("reg-username").value,
         document.getElementById("reg-password").value,
         document.getElementById("reg-displayname").value,
       );
-    } catch (err) {
-      errEl.textContent = err.message;
-      errEl.style.display = "block";
+    } catch (ex) {
+      err.textContent = ex.message;
+      err.style.display = "block";
     }
   });
   document.getElementById("goto-login").addEventListener("click", function () {
@@ -489,102 +576,97 @@ function renderRegister() {
 }
 
 function renderMain() {
-  const messagesHtml = state.messages
+  var statusClass = state.connected ? "connected" : "disconnected";
+  var statusText = state.connected
+    ? "已连接"
+    : state.gatewayStatus === "unavailable"
+      ? "Gateway 未启动"
+      : "连接中...";
+
+  var msgsHtml = state.messages
     .map(function (m) {
       if (m.role === "system")
-        return '<div class="message message-system">' + escapeHtml(m.content) + "</div>";
+        return '<div class="message message-system">' + esc(m.content) + "</div>";
       if (m.role === "user")
-        return '<div class="message message-user">' + escapeHtml(m.content) + "</div>";
-      return '<div class="message message-assistant">' + escapeHtml(m.content) + "</div>";
+        return '<div class="message message-user">' + esc(m.content) + "</div>";
+      return '<div class="message message-assistant">' + esc(m.content) + "</div>";
     })
     .join("");
 
-  const streamingHtml = state.streaming
+  var streamHtml = state.streaming
     ? '<div class="message message-assistant">' +
-      escapeHtml(state.streaming) +
+      esc(state.streaming) +
       '<span style="opacity:0.5">\u2588</span></div>'
     : "";
-
-  const typingHtml =
+  var typingHtml =
     state.sending && !state.streaming
       ? '<div class="typing-indicator"><div class="typing-dots"><span></span><span></span><span></span></div> 思考中...</div>'
       : "";
-
-  const statusClass = state.connected ? "connected" : "disconnected";
-  let statusText = "未连接";
-  if (state.connected) statusText = "已连接";
-  else if (state.gatewayStatus === "unavailable") statusText = "Gateway 未启动";
-  else if (state.gatewayStatus === "disconnected") statusText = "连接中...";
-  const sidebarContent =
-    state.sidebarTab === "workspace" ? renderWorkspaceSidebar() : renderAgentInfo();
-
-  let rightPanel = "";
-  if (state.viewingFile) {
-    rightPanel =
-      '<div class="file-viewer">' +
-      '<div class="file-viewer-header"><span>' +
-      escapeHtml(state.viewingFile) +
-      "</span>" +
-      '<button class="btn btn-ghost" id="close-file" style="padding:0.25rem 0.5rem;font-size:0.75rem">关闭</button></div>' +
-      '<div class="file-viewer-content">' +
-      escapeHtml(state.viewingFileContent) +
-      "</div></div>";
-  }
-
-  const emptyHtml =
-    state.messages.length === 0 && !state.streaming
+  var emptyChat =
+    !state.messages.length && !state.streaming
       ? '<div class="empty-state"><div class="icon">\uD83D\uDCAC</div><div>发送一条消息开始对话</div></div>'
       : "";
+
+  var rightPanel = "";
+  if (state.viewingFile) {
+    if (state.editingFile) {
+      rightPanel =
+        '<div class="file-viewer"><div class="file-viewer-header"><span>' +
+        esc(state.viewingFile) +
+        '</span><div><button class="btn btn-primary" id="btn-save" style="padding:0.25rem 0.75rem;font-size:0.75rem;margin-right:0.25rem">保存</button><button class="btn btn-ghost" id="btn-cancel-edit" style="padding:0.25rem 0.5rem;font-size:0.75rem">取消</button></div></div><textarea id="file-editor" class="file-editor">' +
+        esc(state.editContent) +
+        "</textarea></div>";
+    } else {
+      rightPanel =
+        '<div class="file-viewer"><div class="file-viewer-header"><span>' +
+        esc(state.viewingFile) +
+        '</span><div><button class="btn btn-ghost" id="btn-edit" style="padding:0.25rem 0.5rem;font-size:0.75rem;margin-right:0.25rem">编辑</button><button class="btn btn-ghost" id="btn-close-file" style="padding:0.25rem 0.5rem;font-size:0.75rem">关闭</button></div></div><div class="file-viewer-content">' +
+        esc(state.viewingFileContent) +
+        "</div></div>";
+    }
+  }
 
   app.innerHTML =
     '<div class="main-layout">' +
     '<div class="sidebar">' +
-    '<div class="sidebar-header"><h2>OpenClaw</h2>' +
-    '<button class="btn btn-ghost" id="btn-logout" style="padding:0.25rem 0.5rem;font-size:0.75rem">退出</button></div>' +
-    '<div class="sidebar-tabs">' +
-    '<button class="sidebar-tab ' +
+    '<div class="sidebar-header"><h2>OpenClaw</h2><button class="btn btn-ghost" id="btn-logout" style="padding:0.25rem 0.5rem;font-size:0.75rem">退出</button></div>' +
+    '<div class="sidebar-tabs"><button class="sidebar-tab ' +
     (state.sidebarTab === "workspace" ? "active" : "") +
-    '" data-tab="workspace">工作区</button>' +
-    '<button class="sidebar-tab ' +
+    '" data-tab="workspace">工作区</button><button class="sidebar-tab ' +
     (state.sidebarTab === "agent" ? "active" : "") +
     '" data-tab="agent">Agent</button></div>' +
     '<div class="sidebar-content">' +
-    sidebarContent +
+    (state.sidebarTab === "workspace" ? renderWorkspaceSidebar() : renderAgentInfo()) +
     "</div>" +
     '<div class="sidebar-footer"><span>' +
-    escapeHtml(state.user ? state.user.displayName : "") +
-    "</span>" +
-    '<button class="btn btn-danger" id="btn-delete-account" style="padding:0.125rem 0.375rem;font-size:0.6875rem">注销账号</button></div></div>' +
+    esc(state.user ? state.user.displayName : "") +
+    '</span><button class="btn btn-danger" id="btn-delete-account" style="padding:0.125rem 0.375rem;font-size:0.6875rem">注销账号</button></div>' +
+    "</div>" +
     '<div class="chat-area">' +
-    '<div class="chat-header"><div class="chat-header-left"><h3>Chat</h3>' +
-    '<span class="connection-status ' +
+    '<div class="chat-header"><div class="chat-header-left"><h3>Chat</h3><span class="connection-status ' +
     statusClass +
     '">' +
     statusText +
-    "</span></div>" +
-    '<span style="font-size:0.75rem;color:var(--text-muted)">Agent: ' +
-    escapeHtml(state.agentId || "") +
+    '</span></div><span style="font-size:0.75rem;color:var(--text-muted)">Agent: ' +
+    esc(state.agentId || "") +
     "</span></div>" +
     '<div class="chat-messages" id="chat-messages">' +
-    emptyHtml +
-    messagesHtml +
-    streamingHtml +
+    emptyChat +
+    msgsHtml +
+    streamHtml +
     typingHtml +
     "</div>" +
-    '<div class="chat-input-area"><div class="chat-input-wrapper">' +
-    '<textarea class="chat-input" id="chat-input" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)" rows="1"></textarea>' +
-    '<button class="send-btn" id="send-btn"' +
+    '<div class="chat-input-area"><div class="chat-input-wrapper"><textarea class="chat-input" id="chat-input" placeholder="输入消息... (Enter 发送)" rows="1"></textarea><button class="send-btn" id="send-btn"' +
     (state.sending ? " disabled" : "") +
-    ">发送</button>" +
-    "</div></div></div>" +
+    ">发送</button></div></div>" +
+    "</div>" +
     rightPanel +
     "</div>";
 
   // Bind events
   document.getElementById("btn-logout").addEventListener("click", doLogout);
   document.getElementById("btn-delete-account").addEventListener("click", doDeleteAccount);
-
-  const input = document.getElementById("chat-input");
+  var input = document.getElementById("chat-input");
   input.addEventListener("keydown", function (e) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -596,153 +678,178 @@ function renderMain() {
   input.addEventListener("input", function () {
     autoResize(input);
   });
-
   document.getElementById("send-btn").addEventListener("click", function () {
     void sendMessage(input.value);
     input.value = "";
     autoResize(input);
   });
-
-  document.querySelectorAll(".sidebar-tab").forEach(function (tab) {
-    tab.addEventListener("click", function () {
-      state.sidebarTab = tab.dataset.tab;
+  document.querySelectorAll(".sidebar-tab").forEach(function (t) {
+    t.addEventListener("click", function () {
+      state.sidebarTab = t.dataset.tab;
       render();
     });
   });
-
-  document.querySelectorAll("[data-file]").forEach(function (el) {
+  document.querySelectorAll("[data-open]").forEach(function (el) {
     el.addEventListener("click", function () {
-      void openFile(el.dataset.file);
+      void openFile(el.dataset.open);
     });
   });
-
   document.querySelectorAll("[data-dir]").forEach(function (el) {
     el.addEventListener("click", function () {
       void loadTree(el.dataset.dir);
     });
   });
-
-  const closeBtn = document.getElementById("close-file");
-  if (closeBtn) closeBtn.addEventListener("click", closeFile);
-
-  const backBtn = document.getElementById("btn-tree-back");
-  if (backBtn) {
-    backBtn.addEventListener("click", function () {
-      const parent = state.treePath.split("/").slice(0, -1).join("/");
-      void loadTree(parent);
+  document.querySelectorAll("[data-delete]").forEach(function (el) {
+    el.addEventListener("click", function (e) {
+      e.stopPropagation();
+      void deleteItem(el.dataset.delete);
     });
-  }
+  });
+  document.querySelectorAll("[data-rename]").forEach(function (el) {
+    el.addEventListener("click", function (e) {
+      e.stopPropagation();
+      void renameItem(el.dataset.rename);
+    });
+  });
+
+  var closeBtn = document.getElementById("btn-close-file");
+  if (closeBtn) closeBtn.addEventListener("click", closeFile);
+  var editBtn = document.getElementById("btn-edit");
+  if (editBtn) editBtn.addEventListener("click", startEdit);
+  var saveBtn = document.getElementById("btn-save");
+  if (saveBtn)
+    saveBtn.addEventListener("click", function () {
+      void saveFile();
+    });
+  var cancelBtn = document.getElementById("btn-cancel-edit");
+  if (cancelBtn) cancelBtn.addEventListener("click", cancelEdit);
+  var editor = document.getElementById("file-editor");
+  if (editor)
+    editor.addEventListener("input", function () {
+      state.editContent = editor.value;
+    });
+  var treeBack = document.getElementById("btn-tree-back");
+  if (treeBack)
+    treeBack.addEventListener("click", function () {
+      void loadTree(state.treePath.split("/").slice(0, -1).join("/"));
+    });
+  var btnNewFile = document.getElementById("btn-new-file");
+  if (btnNewFile)
+    btnNewFile.addEventListener("click", function () {
+      void createNewFile();
+    });
+  var btnNewFolder = document.getElementById("btn-new-folder");
+  if (btnNewFolder)
+    btnNewFolder.addEventListener("click", function () {
+      void createNewFolder();
+    });
+  var btnUpload = document.getElementById("btn-upload");
+  if (btnUpload)
+    btnUpload.addEventListener("click", function () {
+      void uploadFiles();
+    });
+  var btnUploadDir = document.getElementById("btn-upload-dir");
+  if (btnUploadDir)
+    btnUploadDir.addEventListener("click", function () {
+      void uploadFolder();
+    });
 
   scrollToBottom();
   input.focus();
 }
 
 function renderWorkspaceSidebar() {
-  let html = "";
-  if (state.workspacePath) {
-    html +=
-      '<div class="workspace-path">\uD83D\uDCC1 ' + escapeHtml(state.workspacePath) + "</div>";
-  }
+  var h = "";
+  if (state.workspacePath)
+    h += '<div class="workspace-path">\uD83D\uDCC1 ' + esc(state.workspacePath) + "</div>";
+
+  // Toolbar
+  h += '<div class="ws-toolbar">';
+  h += '<button class="ws-btn" id="btn-new-file" title="新建文件">\uD83D\uDCC4+</button>';
+  h += '<button class="ws-btn" id="btn-new-folder" title="新建文件夹">\uD83D\uDCC1+</button>';
+  h += '<button class="ws-btn" id="btn-upload" title="上传文件">\u2B06\uFE0F</button>';
+  h += '<button class="ws-btn" id="btn-upload-dir" title="上传文件夹">\uD83D\uDCC2\u2B06</button>';
+  h += "</div>";
+
   if (state.treePath) {
-    html +=
+    h +=
       '<div class="file-tree-item" id="btn-tree-back"><span class="icon">\u2B05\uFE0F</span><span class="name">..</span></div>';
   }
-  for (let i = 0; i < state.workspaceTree.length; i++) {
-    const item = state.workspaceTree[i];
+
+  for (var i = 0; i < state.workspaceTree.length; i++) {
+    var item = state.workspaceTree[i];
+    var relPath = state.treePath ? state.treePath + "/" + item.name : item.name;
     if (item.isDirectory) {
-      const dirPath = state.treePath ? state.treePath + "/" + item.name : item.name;
-      html +=
-        '<div class="file-tree-item" data-dir="' +
-        escapeHtml(dirPath) +
-        '"><span class="icon">\uD83D\uDCC1</span><span class="name">' +
-        escapeHtml(item.name) +
-        "</span></div>";
+      h += '<div class="file-tree-item" data-dir="' + esc(relPath) + '">';
+      h += '<span class="icon">\uD83D\uDCC1</span><span class="name">' + esc(item.name) + "</span>";
+      h +=
+        '<span class="item-actions"><button class="act-btn" data-rename="' +
+        esc(item.name) +
+        '" title="重命名">\u270F</button><button class="act-btn act-del" data-delete="' +
+        esc(item.name) +
+        '" title="删除">\u2716</button></span>';
+      h += "</div>";
     } else {
-      const filePath = state.treePath ? state.treePath + "/" + item.name : item.name;
-      const size = item.size != null ? formatBytes(item.size) : "";
-      const active = state.viewingFile === filePath ? " active" : "";
-      html +=
-        '<div class="file-tree-item' +
-        active +
-        '" data-file="' +
-        escapeHtml(filePath) +
-        '"><span class="icon">\uD83D\uDCC4</span><span class="name">' +
-        escapeHtml(item.name) +
+      var size = item.size != null ? formatBytes(item.size) : "";
+      var active = state.viewingFile === relPath ? " active" : "";
+      h += '<div class="file-tree-item' + active + '" data-open="' + esc(relPath) + '">';
+      h +=
+        '<span class="icon">\uD83D\uDCC4</span><span class="name">' +
+        esc(item.name) +
         '</span><span class="size">' +
         size +
-        "</span></div>";
+        "</span>";
+      h +=
+        '<span class="item-actions"><button class="act-btn" data-rename="' +
+        esc(item.name) +
+        '" title="重命名">\u270F</button><button class="act-btn act-del" data-delete="' +
+        esc(item.name) +
+        '" title="删除">\u2716</button></span>';
+      h += "</div>";
     }
   }
-  if (state.workspaceTree.length === 0 && !state.treePath) {
-    html +=
-      '<div style="padding:1rem;text-align:center;color:var(--text-muted);font-size:0.8125rem">工作区为空</div>';
+  if (!state.workspaceTree.length && !state.treePath) {
+    h +=
+      '<div style="padding:1rem;text-align:center;color:var(--text-muted);font-size:0.8125rem">工作区为空，点击上方按钮创建或上传文件</div>';
   }
-  if (state.workspaceFiles.length > 0) {
-    html +=
-      '<div style="padding:0.5rem;margin-top:0.5rem;font-size:0.75rem;color:var(--text-muted);border-top:1px solid var(--border)">Agent 文件</div>';
-    for (let i = 0; i < state.workspaceFiles.length; i++) {
-      const f = state.workspaceFiles[i];
-      const icon = f.missing ? "\u2B1C" : "\uD83D\uDCDD";
-      const sizeText = f.missing ? "未创建" : formatBytes(f.size || 0);
-      html +=
-        '<div class="file-tree-item" data-file="' +
-        escapeHtml(f.name) +
-        '"><span class="icon">' +
-        icon +
-        '</span><span class="name">' +
-        escapeHtml(f.name) +
-        '</span><span class="size">' +
-        sizeText +
-        "</span></div>";
-    }
-  }
-  return html;
+  return h;
 }
 
 function renderAgentInfo() {
   if (!state.user) return "";
   return (
     '<div style="padding:1rem">' +
-    '<div style="margin-bottom:1rem"><div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:0.25rem">Agent ID</div>' +
-    '<div style="font-family:var(--font-mono);font-size:0.875rem">' +
-    escapeHtml(state.agentId || "") +
+    '<div style="margin-bottom:1rem"><div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:0.25rem">Agent ID</div><div style="font-family:var(--font-mono);font-size:0.875rem">' +
+    esc(state.agentId || "") +
     "</div></div>" +
-    '<div style="margin-bottom:1rem"><div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:0.25rem">用户名</div>' +
-    '<div style="font-size:0.875rem">' +
-    escapeHtml(state.user.username) +
+    '<div style="margin-bottom:1rem"><div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:0.25rem">用户名</div><div style="font-size:0.875rem">' +
+    esc(state.user.username) +
     "</div></div>" +
-    '<div style="margin-bottom:1rem"><div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:0.25rem">显示名称</div>' +
-    '<div style="font-size:0.875rem">' +
-    escapeHtml(state.user.displayName) +
+    '<div style="margin-bottom:1rem"><div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:0.25rem">显示名称</div><div style="font-size:0.875rem">' +
+    esc(state.user.displayName) +
     "</div></div>" +
-    '<div style="margin-bottom:1rem"><div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:0.25rem">Session Key</div>' +
-    '<div style="font-family:var(--font-mono);font-size:0.75rem;word-break:break-all">' +
-    escapeHtml(state.sessionKey || "未连接") +
+    '<div style="margin-bottom:1rem"><div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:0.25rem">Session Key</div><div style="font-family:var(--font-mono);font-size:0.75rem;word-break:break-all">' +
+    esc(state.sessionKey || "未连接") +
     "</div></div>" +
-    '<div style="margin-bottom:1rem"><div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:0.25rem">连接状态</div>' +
-    '<div style="font-size:0.875rem">' +
+    '<div style="margin-bottom:1rem"><div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:0.25rem">连接状态</div><div style="font-size:0.875rem">' +
     (state.connected ? "\u2705 已连接" : "\u274C 未连接") +
     "</div></div></div>"
   );
 }
 
-// ---- Utilities ----
-function escapeHtml(str) {
-  const div = document.createElement("div");
-  div.textContent = str || "";
-  return div.innerHTML;
+function esc(str) {
+  var d = document.createElement("div");
+  d.textContent = str || "";
+  return d.innerHTML;
+}
+function formatBytes(b) {
+  if (b < 1024) return b + " B";
+  if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
+  return (b / 1048576).toFixed(1) + " MB";
+}
+function autoResize(ta) {
+  ta.style.height = "auto";
+  ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
 }
 
-function formatBytes(bytes) {
-  if (bytes < 1024) return bytes + " B";
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
-  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
-}
-
-function autoResize(textarea) {
-  textarea.style.height = "auto";
-  textarea.style.height = Math.min(textarea.scrollHeight, 200) + "px";
-}
-
-// ---- Init ----
 void checkAuth();

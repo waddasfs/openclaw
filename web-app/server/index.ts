@@ -3,13 +3,7 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
-import {
-  createAgent,
-  deleteAgent,
-  listAgentFiles,
-  getAgentFile,
-  setAgentFile,
-} from "./gateway-admin.js";
+import { createAgent, deleteAgent } from "./gateway-admin.js";
 import { createToken, verifyToken, type TokenPayload } from "./jwt.js";
 import { createUser, authenticateUser, deleteUser, findUserById } from "./user-store.js";
 
@@ -107,6 +101,156 @@ function serveStatic(res: http.ServerResponse, filePath: string): void {
 
 function resolveAgentWorkspace(agentId: string): string {
   return path.join(WORKSPACE_BASE, `workspace-${agentId}`);
+}
+
+type UploadedFile = { path: string; size: number };
+
+async function handleMultipartUpload(
+  req: http.IncomingMessage,
+  workspace: string,
+): Promise<UploadedFile[]> {
+  const boundary = extractBoundary(req.headers["content-type"] || "");
+  if (!boundary) {
+    throw new Error("missing boundary");
+  }
+
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let totalSize = 0;
+    const MAX_SIZE = 50 * 1024 * 1024;
+
+    req.on("data", (chunk: Buffer) => {
+      totalSize += chunk.length;
+      if (totalSize > MAX_SIZE) {
+        reject(new Error("上传文件总大小超过 50MB 限制"));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+
+    req.on("end", () => {
+      try {
+        const body = Buffer.concat(chunks);
+        const files = parseMultipartBody(body, boundary, workspace);
+        resolve(files);
+      } catch (err) {
+        reject(err);
+      }
+    });
+
+    req.on("error", reject);
+  });
+}
+
+function extractBoundary(contentType: string): string | null {
+  const match = /boundary=(?:"([^"]+)"|([^\s;]+))/.exec(contentType);
+  return match ? match[1] || match[2] || null : null;
+}
+
+function parseMultipartBody(body: Buffer, boundary: string, workspace: string): UploadedFile[] {
+  const sep = Buffer.from(`--${boundary}`);
+  const files: UploadedFile[] = [];
+  let start = 0;
+
+  while (true) {
+    const partStart = indexOf(body, sep, start);
+    if (partStart < 0) {
+      break;
+    }
+    const afterSep = partStart + sep.length;
+    if (body[afterSep] === 0x2d && body[afterSep + 1] === 0x2d) {
+      break;
+    }
+    const nextPartStart = indexOf(body, sep, afterSep);
+    if (nextPartStart < 0) {
+      break;
+    }
+
+    const partBody = body.subarray(afterSep, nextPartStart);
+    const headerEnd = indexOf(partBody, Buffer.from("\r\n\r\n"), 0);
+    if (headerEnd < 0) {
+      start = nextPartStart;
+      continue;
+    }
+
+    const headerStr = partBody.subarray(0, headerEnd).toString("utf-8");
+    const fileContent = partBody.subarray(headerEnd + 4, partBody.length - 2);
+
+    const nameMatch = /name="([^"]*)"/.exec(headerStr);
+    const filenameMatch = /filename="([^"]*)"/.exec(headerStr);
+    const fieldName = nameMatch?.[1] || "";
+    const filename = filenameMatch?.[1] || "";
+
+    if (fieldName === "targetDir") {
+      start = nextPartStart;
+      continue;
+    }
+
+    if (filename) {
+      // webkitRelativePath is sent in a separate field, but browsers also encode it in filename
+      const safePath = filename.replace(/\\/g, "/").replace(/\.\./g, "").replace(/^\//, "");
+      if (!safePath) {
+        start = nextPartStart;
+        continue;
+      }
+
+      const targetDirField = extractFieldValue(body, boundary, "targetDir") || "";
+      const relDir = targetDirField.replace(/\\/g, "/").replace(/\.\./g, "").replace(/^\//, "");
+      const fullRelPath = relDir ? path.join(relDir, safePath) : safePath;
+      const targetPath = path.resolve(workspace, fullRelPath);
+
+      if (!targetPath.startsWith(path.resolve(workspace))) {
+        start = nextPartStart;
+        continue;
+      }
+
+      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+      fs.writeFileSync(targetPath, fileContent);
+      files.push({ path: fullRelPath, size: fileContent.length });
+    }
+
+    start = nextPartStart;
+  }
+
+  return files;
+}
+
+function extractFieldValue(body: Buffer, boundary: string, fieldName: string): string | null {
+  const pattern = Buffer.from(`name="${fieldName}"`);
+  const idx = indexOf(body, pattern, 0);
+  if (idx < 0) {
+    return null;
+  }
+  const headerEnd = indexOf(body, Buffer.from("\r\n\r\n"), idx);
+  if (headerEnd < 0) {
+    return null;
+  }
+  const sep = Buffer.from(`--${boundary}`);
+  const nextSep = indexOf(body, sep, headerEnd);
+  if (nextSep < 0) {
+    return null;
+  }
+  return body
+    .subarray(headerEnd + 4, nextSep - 2)
+    .toString("utf-8")
+    .trim();
+}
+
+function indexOf(buf: Buffer, search: Buffer, fromIndex: number): number {
+  for (let i = fromIndex; i <= buf.length - search.length; i++) {
+    let found = true;
+    for (let j = 0; j < search.length; j++) {
+      if (buf[i + j] !== search[j]) {
+        found = false;
+        break;
+      }
+    }
+    if (found) {
+      return i;
+    }
+  }
+  return -1;
 }
 
 async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -233,64 +377,20 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     return;
   }
 
-  // --- Workspace endpoints ---
-  if (url.pathname === "/api/workspace/files" && method === "GET") {
-    const payload = extractToken(req);
-    if (!payload) {
-      json(res, 401, { error: "未登录" });
-      return;
+  // --- Workspace helpers ---
+  function resolveWorkspaceTarget(
+    payload: TokenPayload,
+    subPath: string,
+  ): { workspace: string; target: string } | null {
+    const workspace = resolveAgentWorkspace(payload.agentId);
+    const target = path.resolve(workspace, subPath);
+    if (!target.startsWith(path.resolve(workspace))) {
+      return null;
     }
-    try {
-      const result = await listAgentFiles(payload.agentId);
-      json(res, 200, result);
-    } catch (err) {
-      json(res, 500, { error: String(err) });
-    }
-    return;
+    return { workspace, target };
   }
 
-  if (url.pathname === "/api/workspace/file" && method === "GET") {
-    const payload = extractToken(req);
-    if (!payload) {
-      json(res, 401, { error: "未登录" });
-      return;
-    }
-    const name = url.searchParams.get("name");
-    if (!name) {
-      json(res, 400, { error: "缺少 name 参数" });
-      return;
-    }
-    try {
-      const result = await getAgentFile(payload.agentId, name);
-      json(res, 200, result);
-    } catch (err) {
-      json(res, 500, { error: String(err) });
-    }
-    return;
-  }
-
-  if (url.pathname === "/api/workspace/file" && method === "POST") {
-    const payload = extractToken(req);
-    if (!payload) {
-      json(res, 401, { error: "未登录" });
-      return;
-    }
-    const body = await parseBody(req);
-    const name = typeof body.name === "string" ? body.name : "";
-    const content = typeof body.content === "string" ? body.content : "";
-    if (!name) {
-      json(res, 400, { error: "缺少 name 参数" });
-      return;
-    }
-    try {
-      const result = await setAgentFile(payload.agentId, name, content);
-      json(res, 200, result);
-    } catch (err) {
-      json(res, 500, { error: String(err) });
-    }
-    return;
-  }
-
+  // GET /api/workspace/path — workspace root path
   if (url.pathname === "/api/workspace/path" && method === "GET") {
     const payload = extractToken(req);
     if (!payload) {
@@ -302,30 +402,41 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     return;
   }
 
-  // --- Workspace directory browsing (reads filesystem directly) ---
+  // GET /api/workspace/tree — list directory contents
   if (url.pathname === "/api/workspace/tree" && method === "GET") {
     const payload = extractToken(req);
     if (!payload) {
       json(res, 401, { error: "未登录" });
       return;
     }
-    const workspace = resolveAgentWorkspace(payload.agentId);
     const subPath = url.searchParams.get("path") || "";
-    const targetDir = path.resolve(workspace, subPath);
-
-    // Prevent directory traversal
-    if (!targetDir.startsWith(path.resolve(workspace))) {
+    const resolved = resolveWorkspaceTarget(payload, subPath);
+    if (!resolved) {
       json(res, 403, { error: "路径不合法" });
       return;
     }
 
     try {
-      const entries = fs.readdirSync(targetDir, { withFileTypes: true });
-      const items = entries.map((e) => ({
-        name: e.name,
-        isDirectory: e.isDirectory(),
-        size: e.isFile() ? fs.statSync(path.join(targetDir, e.name)).size : undefined,
-      }));
+      const entries = fs.readdirSync(resolved.target, { withFileTypes: true });
+      const items = entries
+        .filter((e) => !e.name.startsWith("."))
+        .map((e) => {
+          const fullPath = path.join(resolved.target, e.name);
+          const isDir = e.isDirectory();
+          const stat = isDir ? undefined : fs.statSync(fullPath);
+          return {
+            name: e.name,
+            isDirectory: isDir,
+            size: stat?.size,
+            modifiedAt: stat ? Math.floor(stat.mtimeMs) : undefined,
+          };
+        })
+        .toSorted((a, b) => {
+          if (a.isDirectory !== b.isDirectory) {
+            return a.isDirectory ? -1 : 1;
+          }
+          return a.name.localeCompare(b.name);
+        });
       json(res, 200, { path: subPath || "/", items });
     } catch {
       json(res, 200, { path: subPath || "/", items: [] });
@@ -333,31 +444,188 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     return;
   }
 
+  // GET /api/workspace/read — read file content
   if (url.pathname === "/api/workspace/read" && method === "GET") {
     const payload = extractToken(req);
     if (!payload) {
       json(res, 401, { error: "未登录" });
       return;
     }
-    const workspace = resolveAgentWorkspace(payload.agentId);
     const filePath = url.searchParams.get("path") || "";
-    const targetFile = path.resolve(workspace, filePath);
-
-    if (!targetFile.startsWith(path.resolve(workspace))) {
+    if (!filePath) {
+      json(res, 400, { error: "缺少 path 参数" });
+      return;
+    }
+    const resolved = resolveWorkspaceTarget(payload, filePath);
+    if (!resolved) {
       json(res, 403, { error: "路径不合法" });
       return;
     }
 
     try {
-      const stat = fs.statSync(targetFile);
-      if (!stat.isFile() || stat.size > 1024 * 1024) {
-        json(res, 400, { error: "文件不可读或过大" });
+      const stat = fs.statSync(resolved.target);
+      if (!stat.isFile()) {
+        json(res, 400, { error: "不是文件" });
         return;
       }
-      const content = fs.readFileSync(targetFile, "utf-8");
+      if (stat.size > 2 * 1024 * 1024) {
+        json(res, 400, { error: "文件过大（>2MB）" });
+        return;
+      }
+      const content = fs.readFileSync(resolved.target, "utf-8");
       json(res, 200, { path: filePath, content, size: stat.size });
     } catch {
       json(res, 404, { error: "文件不存在" });
+    }
+    return;
+  }
+
+  // POST /api/workspace/write — create or update file
+  if (url.pathname === "/api/workspace/write" && method === "POST") {
+    const payload = extractToken(req);
+    if (!payload) {
+      json(res, 401, { error: "未登录" });
+      return;
+    }
+    const body = await parseBody(req);
+    const filePath = typeof body.path === "string" ? body.path : "";
+    const content = typeof body.content === "string" ? body.content : "";
+    if (!filePath) {
+      json(res, 400, { error: "缺少 path 参数" });
+      return;
+    }
+    const resolved = resolveWorkspaceTarget(payload, filePath);
+    if (!resolved) {
+      json(res, 403, { error: "路径不合法" });
+      return;
+    }
+
+    try {
+      fs.mkdirSync(path.dirname(resolved.target), { recursive: true });
+      fs.writeFileSync(resolved.target, content, "utf-8");
+      const stat = fs.statSync(resolved.target);
+      json(res, 200, { ok: true, path: filePath, size: stat.size });
+    } catch (err: unknown) {
+      json(res, 500, { error: `写入失败: ${err instanceof Error ? err.message : "unknown"}` });
+    }
+    return;
+  }
+
+  // POST /api/workspace/mkdir — create directory
+  if (url.pathname === "/api/workspace/mkdir" && method === "POST") {
+    const payload = extractToken(req);
+    if (!payload) {
+      json(res, 401, { error: "未登录" });
+      return;
+    }
+    const body = await parseBody(req);
+    const dirPath = typeof body.path === "string" ? body.path : "";
+    if (!dirPath) {
+      json(res, 400, { error: "缺少 path 参数" });
+      return;
+    }
+    const resolved = resolveWorkspaceTarget(payload, dirPath);
+    if (!resolved) {
+      json(res, 403, { error: "路径不合法" });
+      return;
+    }
+
+    try {
+      fs.mkdirSync(resolved.target, { recursive: true });
+      json(res, 200, { ok: true, path: dirPath });
+    } catch (err: unknown) {
+      json(res, 500, { error: `创建目录失败: ${err instanceof Error ? err.message : "unknown"}` });
+    }
+    return;
+  }
+
+  // POST /api/workspace/rename — rename file or directory
+  if (url.pathname === "/api/workspace/rename" && method === "POST") {
+    const payload = extractToken(req);
+    if (!payload) {
+      json(res, 401, { error: "未登录" });
+      return;
+    }
+    const body = await parseBody(req);
+    const oldPath = typeof body.oldPath === "string" ? body.oldPath : "";
+    const newPath = typeof body.newPath === "string" ? body.newPath : "";
+    if (!oldPath || !newPath) {
+      json(res, 400, { error: "缺少 oldPath 或 newPath" });
+      return;
+    }
+    const resolvedOld = resolveWorkspaceTarget(payload, oldPath);
+    const resolvedNew = resolveWorkspaceTarget(payload, newPath);
+    if (!resolvedOld || !resolvedNew) {
+      json(res, 403, { error: "路径不合法" });
+      return;
+    }
+
+    try {
+      fs.mkdirSync(path.dirname(resolvedNew.target), { recursive: true });
+      fs.renameSync(resolvedOld.target, resolvedNew.target);
+      json(res, 200, { ok: true, oldPath, newPath });
+    } catch (err: unknown) {
+      json(res, 500, { error: `重命名失败: ${err instanceof Error ? err.message : "unknown"}` });
+    }
+    return;
+  }
+
+  // DELETE /api/workspace/delete — delete file or directory
+  if (url.pathname === "/api/workspace/delete" && method === "DELETE") {
+    const payload = extractToken(req);
+    if (!payload) {
+      json(res, 401, { error: "未登录" });
+      return;
+    }
+    const filePath = url.searchParams.get("path") || "";
+    if (!filePath) {
+      json(res, 400, { error: "缺少 path 参数" });
+      return;
+    }
+    const resolved = resolveWorkspaceTarget(payload, filePath);
+    if (!resolved) {
+      json(res, 403, { error: "路径不合法" });
+      return;
+    }
+    if (resolved.target === path.resolve(resolved.workspace)) {
+      json(res, 403, { error: "不能删除工作区根目录" });
+      return;
+    }
+
+    try {
+      const stat = fs.statSync(resolved.target);
+      if (stat.isDirectory()) {
+        fs.rmSync(resolved.target, { recursive: true });
+      } else {
+        fs.unlinkSync(resolved.target);
+      }
+      json(res, 200, { ok: true, path: filePath });
+    } catch (err: unknown) {
+      json(res, 500, { error: `删除失败: ${err instanceof Error ? err.message : "unknown"}` });
+    }
+    return;
+  }
+
+  // POST /api/workspace/upload — upload file (multipart form-data)
+  if (url.pathname === "/api/workspace/upload" && method === "POST") {
+    const payload = extractToken(req);
+    if (!payload) {
+      json(res, 401, { error: "未登录" });
+      return;
+    }
+
+    const contentType = req.headers["content-type"] || "";
+    if (!contentType.includes("multipart/form-data")) {
+      json(res, 400, { error: "需要 multipart/form-data" });
+      return;
+    }
+
+    const workspace = resolveAgentWorkspace(payload.agentId);
+    try {
+      const result = await handleMultipartUpload(req, workspace);
+      json(res, 200, { ok: true, files: result });
+    } catch (err: unknown) {
+      json(res, 500, { error: `上传失败: ${err instanceof Error ? err.message : "unknown"}` });
     }
     return;
   }
