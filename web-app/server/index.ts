@@ -118,11 +118,13 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     const workspace = resolveAgentWorkspace(user.agentId);
     try {
       await createAgent(user.agentId, displayName, workspace);
-    } catch (err: unknown) {
-      deleteUser(username);
-      const errMsg = err instanceof Error ? err.message : "unknown error";
-      json(res, 500, { error: `创建 Agent 失败: ${errMsg}` });
-      return;
+    } catch {
+      // Gateway may not be running; create workspace directory manually as fallback
+      try {
+        fs.mkdirSync(workspace, { recursive: true });
+      } catch {
+        // Best effort
+      }
     }
 
     const token = createToken({ sub: user.id, username: user.username, agentId: user.agentId });
@@ -384,104 +386,167 @@ server.on("upgrade", (req, socket, head) => {
   });
 });
 
+function wsRawToString(raw: Buffer | ArrayBuffer | Buffer[]): string {
+  return Buffer.isBuffer(raw)
+    ? raw.toString("utf-8")
+    : Buffer.from(raw as ArrayBuffer).toString("utf-8");
+}
+
 wss.on("connection", (clientWs: WebSocket, _req: http.IncomingMessage, payload: TokenPayload) => {
   const agentId = payload.agentId;
   const sessionKey = `agent:${agentId}:main`;
-
-  // Connect to gateway on behalf of this user
-  const gatewayWs = new WebSocket(GATEWAY_URL);
+  let gatewayWs: WebSocket | null = null;
   let gatewayConnected = false;
-  let handshakeDone = false;
+  let clientClosed = false;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let retryCount = 0;
+  const MAX_RETRIES = 5;
   const pendingFromClient: Array<{ data: string }> = [];
 
-  gatewayWs.on("open", () => {
-    // Wait for connect.challenge
-  });
+  function sendToClient(data: string): void {
+    if (!clientClosed && clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(data);
+    }
+  }
 
-  gatewayWs.on("message", (raw: Buffer | ArrayBuffer | Buffer[]) => {
-    const text = Buffer.isBuffer(raw)
-      ? raw.toString("utf-8")
-      : Buffer.from(raw as ArrayBuffer).toString("utf-8");
-    let msg: Record<string, unknown>;
+  function connectToGateway(): void {
+    if (clientClosed) {
+      return;
+    }
+
+    let handshakeDone = false;
+    gatewayConnected = false;
+
+    let gw: WebSocket;
     try {
-      msg = JSON.parse(text);
+      gw = new WebSocket(GATEWAY_URL);
     } catch {
+      sendToClient(JSON.stringify({ type: "gateway_status", status: "unavailable" }));
+      scheduleRetry();
       return;
     }
+    gatewayWs = gw;
 
-    if (msg.type === "event" && msg.event === "connect.challenge") {
-      const connectFrame = {
-        type: "req",
-        id: `proxy-connect-${Date.now()}`,
-        method: "connect",
-        params: {
-          minProtocol: 3,
-          maxProtocol: 3,
-          client: {
-            id: `web-user-${payload.username}`,
-            displayName: payload.username,
-            version: "1.0.0",
-            platform: "web",
-            mode: "webchat",
-          },
-          role: "operator",
-          ...(GATEWAY_TOKEN ? { auth: { token: GATEWAY_TOKEN } } : {}),
-        },
-      };
-      gatewayWs.send(JSON.stringify(connectFrame));
-      return;
-    }
+    const handshakeTimeout = setTimeout(() => {
+      if (!handshakeDone && gw.readyState !== WebSocket.CLOSED) {
+        gw.close();
+      }
+    }, 10_000);
 
-    if (msg.type === "res" && !handshakeDone) {
-      handshakeDone = true;
-      if (msg.ok) {
-        gatewayConnected = true;
-        // Flush pending messages
-        for (const p of pendingFromClient) {
-          gatewayWs.send(p.data);
-        }
-        pendingFromClient.length = 0;
+    gw.on("open", () => {
+      // Wait for connect.challenge event from gateway
+    });
 
-        // Notify client of connection
-        clientWs.send(
+    gw.on("message", (raw: Buffer | ArrayBuffer | Buffer[]) => {
+      const text = wsRawToString(raw);
+      let msg: Record<string, unknown>;
+      try {
+        msg = JSON.parse(text);
+      } catch {
+        return;
+      }
+
+      if (msg.type === "event" && msg.event === "connect.challenge") {
+        gw.send(
           JSON.stringify({
-            type: "connected",
-            agentId,
-            sessionKey,
-            username: payload.username,
+            type: "req",
+            id: `proxy-connect-${Date.now()}`,
+            method: "connect",
+            params: {
+              minProtocol: 3,
+              maxProtocol: 3,
+              client: {
+                id: `web-user-${payload.username}`,
+                displayName: payload.username,
+                version: "1.0.0",
+                platform: "web",
+                mode: "webchat",
+              },
+              role: "operator",
+              ...(GATEWAY_TOKEN ? { auth: { token: GATEWAY_TOKEN } } : {}),
+            },
           }),
         );
-      } else {
-        clientWs.send(JSON.stringify({ type: "error", message: "Gateway connection failed" }));
-        clientWs.close();
+        return;
+      }
+
+      if (msg.type === "res" && !handshakeDone) {
+        handshakeDone = true;
+        clearTimeout(handshakeTimeout);
+        if (msg.ok) {
+          gatewayConnected = true;
+          retryCount = 0;
+          for (const p of pendingFromClient) {
+            gw.send(p.data);
+          }
+          pendingFromClient.length = 0;
+          sendToClient(
+            JSON.stringify({
+              type: "connected",
+              agentId,
+              sessionKey,
+              username: payload.username,
+            }),
+          );
+        } else {
+          sendToClient(JSON.stringify({ type: "gateway_status", status: "auth_failed" }));
+          gw.close();
+        }
+        return;
+      }
+
+      // Forward all other gateway messages to client
+      sendToClient(text);
+    });
+
+    gw.on("close", () => {
+      clearTimeout(handshakeTimeout);
+      gatewayConnected = false;
+      gatewayWs = null;
+      if (!clientClosed) {
+        sendToClient(JSON.stringify({ type: "gateway_status", status: "disconnected" }));
+        scheduleRetry();
+      }
+    });
+
+    gw.on("error", () => {
+      clearTimeout(handshakeTimeout);
+      // "close" event fires after "error", retry happens there
+    });
+  }
+
+  function scheduleRetry(): void {
+    if (clientClosed || retryCount >= MAX_RETRIES) {
+      if (retryCount >= MAX_RETRIES) {
+        sendToClient(
+          JSON.stringify({
+            type: "gateway_status",
+            status: "unavailable",
+            message: "Gateway 不可用，请确保 openclaw gateway 已启动",
+          }),
+        );
       }
       return;
     }
+    const delay = Math.min(2000 * Math.pow(2, retryCount), 30_000);
+    retryCount++;
+    retryTimer = setTimeout(connectToGateway, delay);
+  }
 
-    // Forward gateway messages to client
-    if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.send(text);
+  function cleanup(): void {
+    clientClosed = true;
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
     }
-  });
-
-  gatewayWs.on("close", () => {
-    gatewayConnected = false;
-    if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.close();
+    if (gatewayWs && gatewayWs.readyState === WebSocket.OPEN) {
+      gatewayWs.close();
     }
-  });
+  }
 
-  gatewayWs.on("error", () => {
-    if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.send(JSON.stringify({ type: "error", message: "Gateway connection error" }));
-      clientWs.close();
-    }
-  });
-
+  // Handle messages from browser client
   clientWs.on("message", (raw: Buffer | ArrayBuffer | Buffer[]) => {
-    const text = Buffer.isBuffer(raw)
-      ? raw.toString("utf-8")
-      : Buffer.from(raw as ArrayBuffer).toString("utf-8");
+    const text = wsRawToString(raw);
     let msg: Record<string, unknown>;
     try {
       msg = JSON.parse(text);
@@ -489,7 +554,6 @@ wss.on("connection", (clientWs: WebSocket, _req: http.IncomingMessage, payload: 
       return;
     }
 
-    // Inject sessionKey and agentId for chat messages
     if (msg.type === "req") {
       const method = msg.method as string;
       const params = (msg.params || {}) as Record<string, unknown>;
@@ -501,23 +565,26 @@ wss.on("connection", (clientWs: WebSocket, _req: http.IncomingMessage, payload: 
         params.sessionKey = sessionKey;
         params.agentId = agentId;
       }
-
       msg.params = params;
     }
 
     const data = JSON.stringify(msg);
-    if (gatewayConnected) {
+    if (gatewayConnected && gatewayWs?.readyState === WebSocket.OPEN) {
       gatewayWs.send(data);
     } else {
       pendingFromClient.push({ data });
+      // If not connected, try to connect
+      if (!gatewayWs && !retryTimer) {
+        connectToGateway();
+      }
     }
   });
 
-  clientWs.on("close", () => {
-    if (gatewayWs.readyState === WebSocket.OPEN) {
-      gatewayWs.close();
-    }
-  });
+  clientWs.on("close", cleanup);
+  clientWs.on("error", cleanup);
+
+  // Start initial gateway connection attempt
+  connectToGateway();
 });
 
 server.listen(PORT, () => {

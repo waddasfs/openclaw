@@ -11,6 +11,8 @@ const state = {
   user: null,
   ws: null,
   connected: false,
+  gatewayStatus: "disconnected",
+  gatewayStatusShown: false,
   sessionKey: null,
   agentId: null,
   messages: [],
@@ -90,7 +92,14 @@ function doLogout() {
   state.token = null;
   state.user = null;
   state.connected = false;
+  state.gatewayStatus = "disconnected";
+  state.gatewayStatusShown = false;
   state.messages = [];
+  wsRetryCount = 0;
+  if (wsRetryTimer) {
+    clearTimeout(wsRetryTimer);
+    wsRetryTimer = null;
+  }
   if (state.ws) {
     state.ws.close();
     state.ws = null;
@@ -110,12 +119,36 @@ async function doDeleteAccount() {
 }
 
 // ---- WebSocket ----
+let wsRetryCount = 0;
+let wsRetryTimer = null;
+const MAX_WS_RETRIES = 10;
+
 function connectWs() {
-  if (state.ws) state.ws.close();
+  if (state.ws) {
+    state.ws.close();
+    state.ws = null;
+  }
+  if (wsRetryTimer) {
+    clearTimeout(wsRetryTimer);
+    wsRetryTimer = null;
+  }
+
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const url = proto + "//" + location.host + "/ws/chat?token=" + state.token;
-  const ws = new WebSocket(url);
+  let ws;
+  try {
+    ws = new WebSocket(url);
+  } catch {
+    state.gatewayStatus = "unavailable";
+    render();
+    scheduleWsRetry();
+    return;
+  }
   state.ws = ws;
+
+  ws.addEventListener("open", function () {
+    // Connection to our web-app server established; waiting for gateway proxy status
+  });
 
   ws.addEventListener("message", function (event) {
     let msg;
@@ -127,13 +160,34 @@ function connectWs() {
 
     if (msg.type === "connected") {
       state.connected = true;
+      state.gatewayStatus = "connected";
       state.sessionKey = msg.sessionKey;
       state.agentId = msg.agentId;
+      wsRetryCount = 0;
       addSystemMessage("已连接到 Agent: " + msg.agentId);
       void loadHistory();
       render();
       return;
     }
+
+    if (msg.type === "gateway_status") {
+      state.gatewayStatus = msg.status;
+      state.connected = msg.status === "connected";
+      if (msg.status === "unavailable" || msg.status === "disconnected") {
+        // Don't spam messages — just update status bar
+        if (!state.gatewayStatusShown) {
+          state.gatewayStatusShown = true;
+          const hint = msg.message || "Gateway 未连接，请确保 openclaw gateway 已运行";
+          addSystemMessage(hint);
+        }
+      }
+      if (msg.status === "auth_failed") {
+        addSystemMessage("Gateway 认证失败，请检查 token 配置");
+      }
+      render();
+      return;
+    }
+
     if (msg.type === "error") {
       addSystemMessage("错误: " + msg.message);
       render();
@@ -151,11 +205,22 @@ function connectWs() {
 
   ws.addEventListener("close", function () {
     state.connected = false;
+    state.ws = null;
     render();
-    setTimeout(function () {
-      if (state.token && state.page === "main") connectWs();
-    }, 3000);
+    scheduleWsRetry();
   });
+
+  ws.addEventListener("error", function () {
+    // "close" fires after "error"
+  });
+}
+
+function scheduleWsRetry() {
+  if (!state.token || state.page !== "main") return;
+  if (wsRetryCount >= MAX_WS_RETRIES) return;
+  const delay = Math.min(3000 * Math.pow(1.5, wsRetryCount), 30000);
+  wsRetryCount++;
+  wsRetryTimer = setTimeout(connectWs, delay);
 }
 
 let reqCounter = 0;
@@ -446,7 +511,10 @@ function renderMain() {
       : "";
 
   const statusClass = state.connected ? "connected" : "disconnected";
-  const statusText = state.connected ? "已连接" : "未连接";
+  let statusText = "未连接";
+  if (state.connected) statusText = "已连接";
+  else if (state.gatewayStatus === "unavailable") statusText = "Gateway 未启动";
+  else if (state.gatewayStatus === "disconnected") statusText = "连接中...";
   const sidebarContent =
     state.sidebarTab === "workspace" ? renderWorkspaceSidebar() : renderAgentInfo();
 
