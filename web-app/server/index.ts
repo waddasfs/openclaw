@@ -523,7 +523,16 @@ wss.on("connection", (clientWs: WebSocket, _req: http.IncomingMessage, payload: 
             }),
           );
         } else {
-          sendToClient(JSON.stringify({ type: "gateway_status", status: "auth_failed" }));
+          const errMsg =
+            (msg.error as { message?: string } | undefined)?.message ?? "unknown auth error";
+          console.error(`[proxy:${payload.username}] gateway auth failed: ${errMsg}`);
+          sendToClient(
+            JSON.stringify({
+              type: "gateway_status",
+              status: "auth_failed",
+              message: `Gateway 认证失败: ${errMsg}`,
+            }),
+          );
           gw.close();
         }
         return;
@@ -533,12 +542,25 @@ wss.on("connection", (clientWs: WebSocket, _req: http.IncomingMessage, payload: 
       sendToClient(text);
     });
 
-    gw.on("close", () => {
+    gw.on("close", (code: number, reason: Buffer) => {
       clearTimeout(handshakeTimeout);
+      const reasonStr = reason.toString("utf-8");
+      if (reasonStr) {
+        console.error(
+          `[proxy:${payload.username}] gateway closed: code=${code} reason=${reasonStr}`,
+        );
+      }
       gatewayConnected = false;
       gatewayWs = null;
       if (!clientClosed) {
-        sendToClient(JSON.stringify({ type: "gateway_status", status: "disconnected" }));
+        const detail = reasonStr ? ` (${reasonStr})` : "";
+        sendToClient(
+          JSON.stringify({
+            type: "gateway_status",
+            status: "disconnected",
+            message: reasonStr ? `Gateway 断开${detail}` : undefined,
+          }),
+        );
         scheduleRetry();
       }
     });
