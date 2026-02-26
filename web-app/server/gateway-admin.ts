@@ -28,7 +28,8 @@ function ensureConnection(): Promise<void> {
   }
 
   connectPromise = new Promise<void>((resolve, reject) => {
-    const socket = new WebSocket(GATEWAY_URL);
+    const gwOrigin = GATEWAY_URL.replace("ws://", "http://").replace("wss://", "https://");
+    const socket = new WebSocket(GATEWAY_URL, { origin: gwOrigin });
     let handshakeDone = false;
 
     socket.on("open", () => {
@@ -55,7 +56,7 @@ function ensureConnection(): Promise<void> {
             minProtocol: 3,
             maxProtocol: 3,
             client: {
-              id: "openclaw-web-app-admin",
+              id: "gateway-client",
               displayName: "Web App Admin",
               version: "1.0.0",
               platform: "node",

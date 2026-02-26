@@ -419,7 +419,9 @@ wss.on("connection", (clientWs: WebSocket, _req: http.IncomingMessage, payload: 
 
     let gw: WebSocket;
     try {
-      gw = new WebSocket(GATEWAY_URL);
+      gw = new WebSocket(GATEWAY_URL, {
+        origin: GATEWAY_URL.replace("ws://", "http://").replace("wss://", "https://"),
+      });
     } catch {
       sendToClient(JSON.stringify({ type: "gateway_status", status: "unavailable" }));
       scheduleRetry();
@@ -434,7 +436,7 @@ wss.on("connection", (clientWs: WebSocket, _req: http.IncomingMessage, payload: 
     }, 10_000);
 
     gw.on("open", () => {
-      // Wait for connect.challenge event from gateway
+      // Waiting for connect.challenge event from gateway
     });
 
     gw.on("message", (raw: Buffer | ArrayBuffer | Buffer[]) => {
@@ -456,8 +458,8 @@ wss.on("connection", (clientWs: WebSocket, _req: http.IncomingMessage, payload: 
               minProtocol: 3,
               maxProtocol: 3,
               client: {
-                id: `web-user-${payload.username}`,
-                displayName: payload.username,
+                id: "gateway-client",
+                displayName: `web-user-${payload.username}`,
                 version: "1.0.0",
                 platform: "web",
                 mode: "webchat",
