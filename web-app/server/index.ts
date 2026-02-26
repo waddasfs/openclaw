@@ -17,12 +17,37 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLIENT_DIR = path.resolve(__dirname, "..", "client");
 const PORT = parseInt(process.env.WEB_APP_PORT || "3000", 10);
 const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || "ws://127.0.0.1:18789";
-const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || "";
 
 const WORKSPACE_BASE = (() => {
   const home = process.env.HOME || process.env.USERPROFILE || "/tmp";
   return process.env.OPENCLAW_STATE_DIR || path.join(home, ".openclaw");
 })();
+
+function readGatewayTokenFromConfig(): string {
+  try {
+    const configPath = path.join(WORKSPACE_BASE, "openclaw.json");
+    const raw = fs.readFileSync(configPath, "utf-8");
+    const cfg = JSON.parse(raw) as { gateway?: { auth?: { token?: string } } };
+    return cfg.gateway?.auth?.token ?? "";
+  } catch {
+    return "";
+  }
+}
+
+// Auto-detect: env var first, then read from openclaw.json
+function resolveGatewayToken(): string {
+  const envToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
+  if (envToken) {
+    return envToken;
+  }
+  const configToken = readGatewayTokenFromConfig();
+  if (configToken) {
+    console.log("Auto-detected gateway token from ~/.openclaw/openclaw.json");
+  }
+  return configToken;
+}
+
+const GATEWAY_TOKEN = resolveGatewayToken();
 
 function parseBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {

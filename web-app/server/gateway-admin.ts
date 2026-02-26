@@ -1,7 +1,27 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { WebSocket } from "ws";
 
 const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || "ws://127.0.0.1:18789";
-const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || "";
+
+function resolveGatewayToken(): string {
+  const envToken = process.env.OPENCLAW_GATEWAY_TOKEN ?? "";
+  if (envToken) {
+    return envToken;
+  }
+  try {
+    const home = process.env.HOME || process.env.USERPROFILE || os.homedir();
+    const stateDir = process.env.OPENCLAW_STATE_DIR || path.join(home, ".openclaw");
+    const raw = fs.readFileSync(path.join(stateDir, "openclaw.json"), "utf-8");
+    const cfg = JSON.parse(raw) as { gateway?: { auth?: { token?: string } } };
+    return cfg.gateway?.auth?.token ?? "";
+  } catch {
+    return "";
+  }
+}
+
+const GATEWAY_TOKEN = resolveGatewayToken();
 
 type Pending = {
   resolve: (value: unknown) => void;

@@ -161,16 +161,10 @@ tail -10 /tmp/openclaw-gateway.log
 
 ## 4. 启动 Web App
 
+Web App 会自动从 `~/.openclaw/openclaw.json` 读取 Gateway token，无需手动设置环境变量。
+
 ```bash
 cd /path/to/openclaw/web-app
-
-# 读取 gateway token（必须在 gateway 启动之后）
-export OPENCLAW_GATEWAY_TOKEN=$(node -e "
-  const c = require('fs').readFileSync(
-    require('os').homedir() + '/.openclaw/openclaw.json', 'utf-8'
-  );
-  console.log(JSON.parse(c).gateway?.auth?.token || '');
-")
 
 # 启动 web-app（默认端口 3000）
 node --import tsx server/index.ts
@@ -181,6 +175,8 @@ WEB_APP_PORT=8080 node --import tsx server/index.ts
 # 后台运行
 nohup node --import tsx server/index.ts > /tmp/openclaw-webapp.log 2>&1 &
 ```
+
+> 启动时应看到 `Auto-detected gateway token from ~/.openclaw/openclaw.json`，说明 token 已自动读取。
 
 ## 5. 访问
 
@@ -193,12 +189,12 @@ nohup node --import tsx server/index.ts > /tmp/openclaw-webapp.log 2>&1 &
 
 ## 环境变量
 
-| 变量名                   | 默认值                 | 说明                           |
-| ------------------------ | ---------------------- | ------------------------------ |
-| `WEB_APP_PORT`           | `3000`                 | Web App 监听端口               |
-| `OPENCLAW_GATEWAY_URL`   | `ws://127.0.0.1:18789` | Gateway WebSocket 地址         |
-| `OPENCLAW_GATEWAY_TOKEN` | (空)                   | Gateway 认证 Token（必须设置） |
-| `OPENCLAW_STATE_DIR`     | `~/.openclaw`          | OpenClaw 状态目录              |
+| 变量名                   | 默认值                 | 说明                                                              |
+| ------------------------ | ---------------------- | ----------------------------------------------------------------- |
+| `WEB_APP_PORT`           | `3000`                 | Web App 监听端口                                                  |
+| `OPENCLAW_GATEWAY_URL`   | `ws://127.0.0.1:18789` | Gateway WebSocket 地址                                            |
+| `OPENCLAW_GATEWAY_TOKEN` | (自动读取)             | Gateway 认证 Token（自动从 openclaw.json 读取，也可手动设置覆盖） |
+| `OPENCLAW_STATE_DIR`     | `~/.openclaw`          | OpenClaw 状态目录                                                 |
 
 ## 一键启动脚本
 
@@ -223,14 +219,6 @@ if ! ss -ltnp | grep -q ":$GATEWAY_PORT"; then
   exit 1
 fi
 echo "Gateway running on port $GATEWAY_PORT"
-
-# Read token
-export OPENCLAW_GATEWAY_TOKEN=$(node -e "
-  const c = require('fs').readFileSync(
-    require('os').homedir() + '/.openclaw/openclaw.json', 'utf-8'
-  );
-  console.log(JSON.parse(c).gateway?.auth?.token || '');
-")
 
 echo "=== Starting Web App ==="
 cd "$REPO_DIR/web-app"
