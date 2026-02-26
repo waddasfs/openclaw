@@ -6,15 +6,16 @@
 
 OpenClaw 的 agent 是系统中的核心隔离单元。每个 agent 拥有：
 
-| 隔离维度 | 存储位置 | 说明 |
-|---------|---------|------|
-| 配置 | `config.agents.list[]` (`AgentConfig`) | 独立的模型、工具、sandbox、技能等配置 |
-| 工作区 | `~/.openclaw/workspace-<id>/` | 独立的工作目录，包含 SOUL.md、TOOLS.md、IDENTITY.md 等 |
-| 会话存储 | `~/.openclaw/agents/<id>/sessions/` | 独立的 session store 和 transcript 文件 |
-| Agent 目录 | `~/.openclaw/agents/<id>/agent/` | 独立的 agent 元数据目录 |
-| Sandbox | `AgentSandboxConfig` (scope: session/agent/shared) | 可选的 Docker 容器隔离 |
+| 隔离维度   | 存储位置                                           | 说明                                                   |
+| ---------- | -------------------------------------------------- | ------------------------------------------------------ |
+| 配置       | `config.agents.list[]` (`AgentConfig`)             | 独立的模型、工具、sandbox、技能等配置                  |
+| 工作区     | `~/.openclaw/workspace-<id>/`                      | 独立的工作目录，包含 SOUL.md、TOOLS.md、IDENTITY.md 等 |
+| 会话存储   | `~/.openclaw/agents/<id>/sessions/`                | 独立的 session store 和 transcript 文件                |
+| Agent 目录 | `~/.openclaw/agents/<id>/agent/`                   | 独立的 agent 元数据目录                                |
+| Sandbox    | `AgentSandboxConfig` (scope: session/agent/shared) | 可选的 Docker 容器隔离                                 |
 
 **关键类型** (`src/config/types.agents.ts`):
+
 ```typescript
 type AgentConfig = {
   id: string;
@@ -49,6 +50,7 @@ OpenClaw 的 "用户" 概念是 **channel-native** 的，没有统一的跨渠�
 ```
 
 **绑定（Binding）匹配优先级**：
+
 1. `binding.peer` — 精确 peer 匹配（如 specific chat ID）
 2. `binding.peer.parent` — 父级 peer（线程继承）
 3. `binding.guild+roles` — Guild + 角色匹配
@@ -63,6 +65,7 @@ OpenClaw 的 "用户" 概念是 **channel-native** 的，没有统一的跨渠�
 ### 1.4 DM Scope 会话范围
 
 `session.dmScope` 配置项控制 DM 消息的会话归并策略：
+
 - `"main"`: 所有 DM 共享一个会话（默认）
 - `"per-peer"`: 每个用户一个独立会话
 - `"per-channel-peer"`: 每个 channel+用户 一个会话
@@ -75,6 +78,7 @@ OpenClaw 的 "用户" 概念是 **channel-native** 的，没有统一的跨渠�
 **目前可以做到的**：
 
 1. **Binding 级别路由**：可以通过配置 binding 把特定用户（peer）路由到特定 agent：
+
    ```yaml
    bindings:
      - agentId: "user-alice"
@@ -119,11 +123,13 @@ OpenClaw 的 "用户" 概念是 **channel-native** 的，没有统一的跨渠�
 **适用场景**：用户量小、可手动管理。
 
 **做法**：
+
 - 利用现有 `agents.create` API 为每个用户创建 agent
 - 利用现有 binding 配置把用户路由到对应 agent
 - 设置 `dmScope: per-peer` + `sandbox.scope: session`
 
 **缺点**：
+
 - 完全手动或需要外部编排
 - 配置文件会膨胀
 - 无法处理用户自注册场景
@@ -137,6 +143,7 @@ OpenClaw 的 "用户" 概念是 **channel-native** 的，没有统一的跨渠�
 #### 3.2.1 新增路由策略 `agentScope: per-sender`
 
 **文件**: `src/config/types.base.ts`
+
 ```typescript
 export type AgentScopeMode = "shared" | "per-sender";
 
@@ -151,6 +158,7 @@ export type SessionConfig = {
 **文件**: `src/routing/resolve-route.ts`
 
 在 `resolveAgentRoute()` 中，当 `agentScope === "per-sender"` 时：
+
 1. 基于 sender identity 生成确定性的 agent ID（如 `user-<channel>-<senderId>` 的 hash）
 2. 检查该 agent 是否已存在
 3. 如不存在，触发自动创建
@@ -180,6 +188,7 @@ export async function deprovisionUserAgent(agentId: string): Promise<void>;
 ```
 
 关键行为：
+
 - 从模板 agent 继承默认配置（model、tools、sandbox 等）
 - 创建独立的 workspace 和 sessions 目录
 - 可选：设置 TTL 自动清理不活跃用户的 agent
@@ -187,6 +196,7 @@ export async function deprovisionUserAgent(agentId: string): Promise<void>;
 #### 3.2.4 修改 Channel 消息处理入口
 
 **涉及文件**（每个 channel 的消息入口）：
+
 - `src/telegram/bot-message-context.ts`
 - `src/discord/monitor/message-handler.preflight.ts`
 - `src/web/auto-reply/monitor/on-message.ts`
@@ -223,13 +233,13 @@ export type AgentConfig = {
 
 ```typescript
 type User = {
-  id: string;              // UUID
+  id: string; // UUID
   displayName: string;
   identities: UserIdentity[];
-  agentId: string;         // 映射的 agent ID
+  agentId: string; // 映射的 agent ID
   createdAt: number;
   lastActiveAt: number;
-  quota?: UserQuota;       // 可选配额限制
+  quota?: UserQuota; // 可选配额限制
 };
 
 type UserIdentity = {
@@ -243,6 +253,7 @@ type UserIdentity = {
 #### 3.3.2 User Store
 
 新文件 `src/users/store.ts`：
+
 - 基于文件系统或 SQLite 的用户存储
 - 按 channel+senderId 索引快速查找
 - 跨渠道身份关联（替代手动 `identityLinks`）
@@ -260,23 +271,24 @@ type UserQuota = {
 
 #### 3.3.4 完整的修改清单
 
-| 模块 | 修改 | 复杂度 |
-|------|------|--------|
-| 配置 Schema | 新增 `agentScope`、`userAgentTemplate` 配置项 | 低 |
-| 路由层 | `resolveAgentRoute()` 增加 sender-aware 路由 | 中 |
-| Agent 生命周期 | 自动 provision/deprovision user agents | 中 |
-| Session Key | 可能需要新的 key 格式 `agent:user-<uid>:...` | 低 |
-| Channel 入口 | 各 channel 传递 sender ID 到路由层 | 中（量大） |
-| 用户存储 | 新增 User Store | 高 |
-| Gateway API | 新增用户管理 API | 中 |
-| CLI | 新增用户管理命令 | 低 |
-| 文档 | 新增用户隔离配置文档 | 低 |
+| 模块           | 修改                                          | 复杂度     |
+| -------------- | --------------------------------------------- | ---------- |
+| 配置 Schema    | 新增 `agentScope`、`userAgentTemplate` 配置项 | 低         |
+| 路由层         | `resolveAgentRoute()` 增加 sender-aware 路由  | 中         |
+| Agent 生命周期 | 自动 provision/deprovision user agents        | 中         |
+| Session Key    | 可能需要新的 key 格式 `agent:user-<uid>:...`  | 低         |
+| Channel 入口   | 各 channel 传递 sender ID 到路由层            | 中（量大） |
+| 用户存储       | 新增 User Store                               | 高         |
+| Gateway API    | 新增用户管理 API                              | 中         |
+| CLI            | 新增用户管理命令                              | 低         |
+| 文档           | 新增用户隔离配置文档                          | 低         |
 
 ## 4. 推荐方案
 
 ### 对于快速验证（POC）
 
 推荐 **方案二**（动态 User→Agent 自动映射），原因：
+
 - 复用现有 agent 隔离基础设施（workspace、sessions、sandbox 全部现成）
 - 修改量适中，核心变更集中在路由层和 agent 自动创建
 - 不需要引入新的持久化层（User Store）
@@ -291,31 +303,31 @@ type UserQuota = {
 
 ### 工作量估算
 
-| 阶段 | 预估工时 |
-|------|---------|
-| 配置 Schema + Zod 验证 | 2-4h |
-| 路由层修改 | 4-8h |
-| Agent 自动创建逻辑 | 4-8h |
-| Channel 入口适配（核心 6 个） | 8-12h |
-| Extension 适配 | 4-8h |
-| 测试 | 8-16h |
-| 文档 | 2-4h |
-| **总计** | **~32-60h** |
+| 阶段                          | 预估工时    |
+| ----------------------------- | ----------- |
+| 配置 Schema + Zod 验证        | 2-4h        |
+| 路由层修改                    | 4-8h        |
+| Agent 自动创建逻辑            | 4-8h        |
+| Channel 入口适配（核心 6 个） | 8-12h       |
+| Extension 适配                | 4-8h        |
+| 测试                          | 8-16h       |
+| 文档                          | 2-4h        |
+| **总计**                      | **~32-60h** |
 
 ## 5. 隔离保证分析
 
 ### 5.1 现有 Agent 隔离已提供的保证
 
-| 维度 | 隔离程度 | 实现方式 |
-|------|---------|---------|
-| 会话历史 | 完全隔离 | 独立 session store + transcript 文件 |
-| 系统提示/人设 | 完全隔离 | 独立 workspace（SOUL.md、IDENTITY.md） |
-| 工具配置 | 完全隔离 | per-agent `AgentToolsConfig` |
-| 模型选择 | 完全隔离 | per-agent `AgentModelConfig` |
-| 工作目录 | 完全隔离 | 独立 workspace 路径 |
-| 文件系统 | 可选隔离 | `sandbox.scope: session` + Docker |
+| 维度          | 隔离程度 | 实现方式                                           |
+| ------------- | -------- | -------------------------------------------------- |
+| 会话历史      | 完全隔离 | 独立 session store + transcript 文件               |
+| 系统提示/人设 | 完全隔离 | 独立 workspace（SOUL.md、IDENTITY.md）             |
+| 工具配置      | 完全隔离 | per-agent `AgentToolsConfig`                       |
+| 模型选择      | 完全隔离 | per-agent `AgentModelConfig`                       |
+| 工作目录      | 完全隔离 | 独立 workspace 路径                                |
+| 文件系统      | 可选隔离 | `sandbox.scope: session` + Docker                  |
 | 记忆/向量搜索 | 部分隔离 | per-agent `MemorySearchConfig`，但底层存储可能共享 |
-| API Key/凭证 | 不隔离 | 全局配置，所有 agent 共享 |
+| API Key/凭证  | 不隔离   | 全局配置，所有 agent 共享                          |
 
 ### 5.2 User→Agent 映射后的额外隔离需求
 
@@ -329,6 +341,7 @@ type UserQuota = {
 **OpenClaw 现有架构为 User→Agent 映射提供了良好的基础**。Agent 层已经实现了完善的隔离机制（workspace、sessions、sandbox），缺失的是从"用户身份"到"agent 实例"的自动化映射层。
 
 最关键的 gap 是：
+
 1. 路由层不感知 sender identity（只感知 peer/channel/guild）
 2. 没有 agent 自动创建/销毁的生命周期管理
 3. 缺少用户→agent 的持久化映射
