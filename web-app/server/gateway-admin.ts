@@ -56,13 +56,20 @@ function ensureConnection(): Promise<void> {
             minProtocol: 3,
             maxProtocol: 3,
             client: {
-              id: "gateway-client",
+              id: "openclaw-control-ui",
               displayName: "Web App Admin",
               version: "1.0.0",
               platform: "node",
               mode: "backend",
             },
             role: "operator",
+            scopes: [
+              "operator.admin",
+              "operator.read",
+              "operator.write",
+              "operator.approvals",
+              "operator.pairing",
+            ],
             ...(GATEWAY_TOKEN ? { auth: { token: GATEWAY_TOKEN } } : {}),
           },
         };
