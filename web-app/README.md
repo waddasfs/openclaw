@@ -25,9 +25,29 @@ pnpm install
 cd ..
 ```
 
-## 2. 配置 OpenClaw
+## 2. 初始化配置
 
-编辑 `~/.openclaw/openclaw.json`（如果不存在则创建）：
+第一步构建完成后，`~/.openclaw/` 目录和配置文件还不存在，需要通过 CLI 命令初始化。
+
+### 2a. 初始化 Gateway 基础配置
+
+在项目根目录（`openclaw/`）下运行：
+
+```bash
+# 这条命令会自动创建 ~/.openclaw/ 目录和 openclaw.json 文件
+node openclaw.mjs config set gateway.mode local
+
+# 允许 web-app 代理连接（必需）
+node openclaw.mjs config set gateway.controlUi.dangerouslyDisableDeviceAuth true
+```
+
+运行后 `~/.openclaw/openclaw.json` 文件就自动生成了。
+
+### 2b. 手动补充模型配置
+
+上面的 CLI 命令无法一次写入完整的模型配置（provider 需要同时包含 models 数组），所以需要手动编辑配置文件。
+
+用文本编辑器打开 `~/.openclaw/openclaw.json`，将内容替换为：
 
 ```json
 {
@@ -35,7 +55,7 @@ cd ..
     "providers": {
       "volcengine": {
         "baseUrl": "https://ark.cn-beijing.volces.com/api/coding/v3",
-        "apiKey": "<你的 API Key>",
+        "apiKey": "<替换为你的 API Key>",
         "api": "openai-completions",
         "models": [
           {
@@ -79,8 +99,7 @@ cd ..
       "dangerouslyDisableDeviceAuth": true
     },
     "auth": {
-      "mode": "token",
-      "token": "<留空，首次启动 gateway 会自动生成>"
+      "mode": "token"
     }
   },
   "commands": {
@@ -100,17 +119,23 @@ cd ..
 }
 ```
 
-或者用 CLI 配置（推荐）：
+> **说明**：
+>
+> - 把 `<替换为你的 API Key>` 换成你的实际 Key
+> - `gateway.auth.token` 不需要手动填写，首次启动 Gateway 时会自动生成并写入
+> - 如果你用的是其他模型提供商（如 OpenAI、Anthropic），按相同格式修改 `models.providers` 部分即可
+
+### 2c. 验证配置
 
 ```bash
-# 设置 gateway 模式
-node openclaw.mjs config set gateway.mode local
+# 确认模型配置正确
+node openclaw.mjs config get agents.defaults.model
+# 应输出: { "primary": "volcengine/glm-4.7" }
 
-# 允许无设备认证连接（web-app 代理需要）
-node openclaw.mjs config set gateway.controlUi.dangerouslyDisableDeviceAuth true
+# 确认 provider 配置正确
+node openclaw.mjs config get models.providers.volcengine.baseUrl
+# 应输出: https://ark.cn-beijing.volces.com/api/coding/v3
 ```
-
-> **注意**：`gateway.auth.token` 会在首次启动 gateway 时自动生成。
 
 ## 3. 启动 Gateway
 
